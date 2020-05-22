@@ -2671,9 +2671,7 @@ undolog_redo(XLogReaderState *record)
 	}
 }
 
-/*
- * For assertions only.
- */
+#ifdef USE_ASSERT_CHECKING
 bool
 AmAttachedToUndoLog(UndoLogControl *log)
 {
@@ -2686,6 +2684,7 @@ AmAttachedToUndoLog(UndoLogControl *log)
 	}
 	return false;
 }
+#endif	/* USE_ASSERT_CHECKING */
 
 /*
  * Fetch database id from the undo log state

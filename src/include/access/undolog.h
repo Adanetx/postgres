@@ -295,7 +295,9 @@ extern void CheckPointUndoLogs(XLogRecPtr checkPointRedo,
 
 extern UndoLogControl *UndoLogGet(UndoLogNumber logno);
 extern UndoLogControl *UndoLogNext(UndoLogControl *log);
+#ifdef USE_ASSERT_CHECKING
 extern bool AmAttachedToUndoLog(UndoLogControl *log);
+#endif	/* USE_ASSERT_CHECKING */
 
 #endif
 
