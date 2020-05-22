@@ -1847,7 +1847,7 @@ undolog_xid_map_add(TransactionId xid, UndoLogNumber logno)
 		MyUndoLogState.xid_map =
 		MemoryContextAllocZero(TopMemoryContext,
 							   sizeof(UndoLogNumber *) *
-							   (1 << (32 - UndoLogXidLowBits)));
+							   (1 << UndoLogXidHighBits));
 		MyUndoLogState.xid_map_oldest_chunk = high_bits;
 	}
 
