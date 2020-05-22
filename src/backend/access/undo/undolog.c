@@ -64,9 +64,10 @@
 #define UndoLogNoGetBankNo(logno)				\
 	((logno) >> (UndoLogNumberBits - UndoLogBankBits))
 
+#define UndoLogsPerBank (1 << (UndoLogNumberBits - UndoLogBankBits))
+
 /* Extract the slot within a bank from an undo log number (lower bits). */
-#define UndoLogNoGetSlotNo(logno)				\
-	((logno) & ((1 << (UndoLogNumberBits - UndoLogBankBits)) - 1))
+#define UndoLogNoGetSlotNo(logno)	 ((logno) & (UndoLogsPerBank - 1))
 
 /*
  * During recovery we maintain a mapping of transaction ID to undo logs
@@ -1583,11 +1584,10 @@ static void
 initialize_undo_log_bank(int bankno, UndoLogControl *bank)
 {
 	int			i;
-	int			logs_per_bank = 1 << (UndoLogNumberBits - UndoLogBankBits);
 
-	for (i = 0; i < logs_per_bank; ++i)
+	for (i = 0; i < UndoLogsPerBank; ++i)
 	{
-		bank[i].logno = logs_per_bank * bankno + i;
+		bank[i].logno = UndoLogsPerBank * bankno + i;
 		LWLockInitialize(&bank[i].mutex, LWTRANCHE_UNDOLOG);
 		LWLockInitialize(&bank[i].discard_lock, LWTRANCHE_UNDODISCARD);
 		LWLockInitialize(&bank[i].discard_update_lock, LWTRANCHE_DISCARD_UPDATE);
@@ -1611,7 +1611,7 @@ ensure_undo_log_number(UndoLogNumber logno)
 		{
 			size_t		size;
 
-			size = sizeof(UndoLogControl) * (1 << UndoLogBankBits);
+			size = sizeof(UndoLogControl) * UndoLogsPerBank;
 			MyUndoLogState.banks[bankno] =
 			MemoryContextAllocZero(TopMemoryContext, size);
 
