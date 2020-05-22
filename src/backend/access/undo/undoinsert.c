@@ -371,17 +371,14 @@ PrepareUpdateUndoActionProgress(XLogReaderState *xlog_record,
 void
 UndoRecordUpdateTransInfo(int idx)
 {
-	UndoLogNumber logno = UndoRecPtrGetLogNo(xact_urec_info[idx].urecptr);
+	UndoRecPtr	urec_ptr = xact_urec_info[idx].urecptr;
+	UndoLogNumber logno = UndoRecPtrGetLogNo(urec_ptr);
 	Page		page = NULL;
 	int			starting_byte;
 	int			already_written = 0;
 	int			i = 0;
-	UndoRecPtr	urec_ptr = InvalidUndoRecPtr;
-	UndoLogControl *log;
+	UndoLogControl *log = UndoLogGet(logno);
 	uint16		remaining_bytes;
-
-	log = UndoLogGet(logno);
-	urec_ptr = xact_urec_info[idx].urecptr;
 
 	/*
 	 * Acquire the discard_update_lock before accessing the undo record so
