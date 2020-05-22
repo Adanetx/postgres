@@ -907,7 +907,7 @@ UndoLogAdvance(UndoRecPtr insertion_point, size_t size, UndoPersistence persiste
 /*
  * Advance the discard pointer in one undo log, discarding all undo data
  * relating to one or more whole transactions.  The passed in undo pointer is
- * the address of the oldest data that the called would like to keep, and the
+ * the address of the oldest data that the caller would like to keep, and the
  * affected undo log is implied by this pointer, ie
  * UndoRecPtrGetLogNo(discard_pointer).
  *
@@ -916,7 +916,7 @@ UndoLogAdvance(UndoRecPtr insertion_point, size_t size, UndoPersistence persiste
  * relevant buffers to be dropped immediately, without writing any data out to
  * disk.  Any attempt to read the buffers (except a partial buffer at the end
  * of this range which will remain) may result in IO errors, because the
- * underlying segment file may physically removed.
+ * underlying segment file may be physically removed.
  *
  * Only one backend should call this for a given undo log concurrently, or
  * data structures will become corrupted.  It is expected that the caller will
@@ -1131,7 +1131,7 @@ UndoLogGetFirstValidRecord(UndoLogNumber logno)
 }
 
 /*
- * Return the ext insert location.  This will also validate the input xid
+ * Return the next insert location.  This will also validate the input xid
  * if latest insert point is not for the same transaction id then this will
  * return Invalid Undo pointer.
  */
@@ -1154,7 +1154,7 @@ UndoLogGetNextInsertPtr(UndoLogNumber logno, TransactionId xid)
 }
 
 /*
- * Rewind the undo log insert position also set the prevlen in the mata
+ * Rewind the undo log insert position and also set the prevlen in the mata
  */
 void
 UndoLogRewind(UndoRecPtr insert_urp)
