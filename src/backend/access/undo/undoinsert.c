@@ -100,10 +100,17 @@
 #define MAX_XACT_UNDO_INFO	2
 
 /*
- * Consider buffers needed for updating previous transaction's
- * starting undo record as well.
+ * Consider buffers needed for updating previous transaction's starting undo
+ * record as well. nrecs is the maximum number of undo records to be stored in
+ * the buffers.
  */
-#define MAX_UNDO_BUFFERS       (MAX_PREPARED_UNDO + MAX_XACT_UNDO_INFO) * MAX_BUFFER_PER_UNDO
+#define MAX_UNDO_BUFFERS(nrecs)	((nrecs) + MAX_XACT_UNDO_INFO) * MAX_BUFFER_PER_UNDO
+
+/*
+ * The maximum number of buffers available unless UndoSetPrepareSize has been
+ * called.
+ */
+#define MAX_UNDO_BUFFERS_DEF	MAX_UNDO_BUFFERS(MAX_PREPARED_UNDO)
 
 /*
  * Previous top transaction id which inserted the undo.  Whenever a new main
@@ -121,7 +128,7 @@ typedef struct UndoBuffers
 	bool		zero;			/* new block full of zeroes */
 } UndoBuffers;
 
-static UndoBuffers def_buffers[MAX_UNDO_BUFFERS];
+static UndoBuffers def_buffers[MAX_UNDO_BUFFERS_DEF];
 static int	buffer_idx;
 
 /*
@@ -817,10 +824,9 @@ UndoSetPrepareSize(UnpackedUndoRecord *undorecords, int nrecords,
 
 		/*
 		 * Consider buffers needed for updating previous transaction's starting
-		 * undo record. Hence increased by 1.
+		 * undo record.
 		 */
-		undo_buffer = palloc0((nrecords + 1) * MAX_BUFFER_PER_UNDO *
-							  sizeof(UndoBuffers));
+		undo_buffer = palloc0(MAX_UNDO_BUFFERS(nrecords) * sizeof(UndoBuffers));
 		max_prepared_undo = nrecords;
 	}
 
