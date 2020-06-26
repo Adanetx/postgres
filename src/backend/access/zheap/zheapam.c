@@ -133,8 +133,9 @@ static void compute_new_xid_infomask(ZHeapTuple zhtup, Buffer buf,
 									 uint16 *result_infomask, int *result_trans_slot);
 static void log_zheap_insert(ZHeapWALInfo *walinfo, Relation relation,
 							 int options, bool skip_undo);
-static void log_zheap_update(ZHeapWALInfo *oldinfo, ZHeapWALInfo *newinfo, bool inplace_update);
-static void log_zheap_delete(ZHeapWALInfo *walinfo, bool changingPart,
+static void log_zheap_update(ZHeapWALInfo *oldinfo, Relation relation,
+							 ZHeapWALInfo *newinfo, bool inplace_update);
+static void log_zheap_delete(ZHeapWALInfo *walinfo, Relation relation, bool changingPart,
 							 SubTransactionId subxid, TransactionId tup_xid);
 static void log_zheap_multi_insert(ZHeapMultiInsertWALInfo *walinfo, bool skip_undo, char *scratch);
 static void log_zheap_lock_tuple(ZHeapWALInfo *walinfo, TransactionId tup_xid,
@@ -863,7 +864,8 @@ check_tup_satisfies_update:
 		del_wal_info.all_visible_cleared = all_visible_cleared;
 		del_wal_info.undorecord = &undorecord;
 
-		log_zheap_delete(&del_wal_info, changingPart, subxid, zinfo.xid);
+		log_zheap_delete(&del_wal_info, relation, changingPart, subxid,
+						 zinfo.xid);
 	}
 
 	END_CRIT_SECTION();
@@ -2162,7 +2164,7 @@ reacquire_buffer:
 		newup_wal_info.prev_urecptr = InvalidUndoRecPtr;
 		newup_wal_info.prior_trans_slot_id = InvalidXactSlotId;
 
-		log_zheap_update(&oldup_wal_info, &newup_wal_info,
+		log_zheap_update(&oldup_wal_info, relation, &newup_wal_info,
 						 use_inplace_update);
 	}
 
@@ -5449,8 +5451,13 @@ log_zheap_insert(ZHeapWALInfo *walinfo, Relation relation,
 	XLogRecPtr	RedoRecPtr;
 	bool		doPageWrites;
 
-	/* zheap doesn't support catalog relations. */
-	Assert(!RelationIsAccessibleInLogicalDecoding(relation));
+	/*
+	 * zheap doesn't support catalog relations, however "user catalog" tables
+	 * are allowed. XXX Special macro for this case, similar to
+	 * RelationIsAccessibleInLogicalDecoding()?
+	 */
+	Assert(!(XLogLogicalInfoActive() && RelationNeedsWAL(relation) &&
+			 IsCatalogRelation(relation)));
 
 	/*
 	 * If this is the single and first tuple on page, we can reinit the page
@@ -5578,8 +5585,8 @@ prepare_xlog:
  * is inserted in case of a non-inplace update.
  */
 static void
-log_zheap_update(ZHeapWALInfo *old_walinfo, ZHeapWALInfo *new_walinfo,
-				 bool inplace_update)
+log_zheap_update(ZHeapWALInfo *old_walinfo, Relation relation,
+				 ZHeapWALInfo *new_walinfo, bool inplace_update)
 {
 	xl_undo_header xlundohdr,
 				xlnewundohdr;
@@ -5600,6 +5607,7 @@ log_zheap_update(ZHeapWALInfo *old_walinfo, ZHeapWALInfo *new_walinfo,
 				newlen;
 	int			bufflags = REGBUF_STANDARD;
 	uint8		info = XLOG_ZHEAP_UPDATE;
+	bool		need_tuple_data = RelationIsLogicallyLogged(relation);
 
 	zhtuphdr = (ZHeapTupleHeader) old_walinfo->undorecord->uur_tuple.data;
 
@@ -5635,7 +5643,8 @@ log_zheap_update(ZHeapWALInfo *old_walinfo, ZHeapWALInfo *new_walinfo,
 	 * prefix-suffix compression.
 	 */
 	if (old_walinfo->buffer == new_walinfo->buffer
-		&& !XLogCheckBufferNeedsBackup(new_walinfo->buffer))
+		&& !XLogCheckBufferNeedsBackup(new_walinfo->buffer) &&
+		!need_tuple_data)
 	{
 		Assert(oldp != NULL && newp != NULL);
 
@@ -5720,7 +5729,8 @@ prepare_xlog:
 	LogUndoMetaData(new_walinfo->undometa);
 
 	GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
-	if (!doPageWrites || XLogCheckBufferNeedsBackup(old_walinfo->buffer))
+	if (!doPageWrites || XLogCheckBufferNeedsBackup(old_walinfo->buffer) ||
+		need_tuple_data)
 	{
 		xlrec.flags |= XLZ_HAS_UPDATE_UNDOTUPLE;
 
@@ -5907,8 +5917,9 @@ CheckZheapPageSlotsAreEmpty(Page page)
  * log_zheap_delete - Perform XLogInsert for a zheap-delete operation.
  */
 static void
-log_zheap_delete(ZHeapWALInfo *walinfo, bool changingPart,
-				 SubTransactionId subxid, TransactionId tup_xid)
+log_zheap_delete(ZHeapWALInfo *walinfo, Relation relation,
+				 bool changingPart, SubTransactionId subxid,
+				 TransactionId tup_xid)
 {
 	ZHeapTupleHeader zhtuphdr = NULL;
 	xl_undo_header xlundohdr;
@@ -5939,7 +5950,8 @@ log_zheap_delete(ZHeapWALInfo *walinfo, bool changingPart,
 	 * If full_page_writes is enabled, and the buffer image is not included in
 	 * the WAL then we can rely on the tuple in the page to regenerate the
 	 * undo tuple during recovery as the tuple state must be same as now,
-	 * otherwise we need to store it explicitly.
+	 * otherwise we need to store it explicitly. Regardless, the tuple has to
+	 * be stored if logical decoding is active.
 	 *
 	 * Since we don't yet have the insert lock, including the page image
 	 * decision could change later and in that case we need prepare the WAL
@@ -5950,7 +5962,8 @@ prepare_xlog:
 	LogUndoMetaData(walinfo->undometa);
 
 	GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
-	if (!doPageWrites || XLogCheckBufferNeedsBackup(walinfo->buffer))
+	if (!doPageWrites || XLogCheckBufferNeedsBackup(walinfo->buffer) ||
+		RelationIsLogicallyLogged(relation))
 	{
 		xlrec.flags |= XLZ_HAS_DELETE_UNDOTUPLE;
 

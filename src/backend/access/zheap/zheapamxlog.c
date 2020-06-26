@@ -1714,8 +1714,7 @@ zheap_xlog_confirm(XLogReaderState *record)
 		}
 		else
 		{
-			Assert(xlrec->flags == XLZ_SPEC_INSERT_FAILED ||
-				   xlrec->flags == XLZ_INSERT_IS_SPECULATIVE);
+			Assert(xlrec->flags == XLZ_SPEC_INSERT_FAILED);
 			ItemIdSetDeadExtended(lp, xlrec->trans_slot_id);
 			ZPageSetPrunable(page, XLogRecGetXid(record));
 		}

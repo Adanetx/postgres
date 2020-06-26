@@ -62,6 +62,7 @@
 #include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "access/zhtup.h"
 #include "catalog/catalog.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
@@ -162,6 +163,9 @@ static const Size max_changes_in_memory = 4096;
  */
 static ReorderBufferTXN *ReorderBufferGetTXN(ReorderBuffer *rb);
 static void ReorderBufferReturnTXN(ReorderBuffer *rb, ReorderBufferTXN *txn);
+static void ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
+													  ReorderBuffer *rb,
+													  Relation relation);
 static ReorderBufferTXN *ReorderBufferTXNByXid(ReorderBuffer *rb,
 											   TransactionId xid, bool create, bool *is_new,
 											   XLogRecPtr lsn, bool create_as_top);
@@ -381,6 +385,10 @@ ReorderBufferReturnChange(ReorderBuffer *rb, ReorderBufferChange *change)
 		case REORDER_BUFFER_CHANGE_UPDATE:
 		case REORDER_BUFFER_CHANGE_DELETE:
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT:
+		case REORDER_BUFFER_CHANGE_INSERT_ZHEAP:
+		case REORDER_BUFFER_CHANGE_UPDATE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_DELETE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP:
 			if (change->data.tp.newtuple)
 			{
 				ReorderBufferReturnTupleBuf(rb, change->data.tp.newtuple);
@@ -445,6 +453,78 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 	tuple->tuple.t_data = ReorderBufferTupleBufData(tuple);
 
 	return tuple;
+}
+
+/*
+ * Like ReorderBufferGetTupleBuf(), but this is for the zheap tuple.
+ *
+ * Return ReorderBufferTupleBuf because the zheap tuple will eventually be
+ * converted to the ordinary heap tuple.
+ *
+ * A separate routine is used instead of adding an argument to
+ * ReorderBufferGetTupleBuf, so that the zheap code is less invasive.
+ */
+ReorderBufferTupleBuf *
+ReorderBufferGetZHeapTupleBuf(ReorderBuffer *rb, Size tuple_len)
+{
+	ReorderBufferTupleBuf *tuple;
+	Size		alloc_len;
+
+	alloc_len = tuple_len + SizeofZHeapTupleHeader;
+
+	tuple = (ReorderBufferTupleBuf *)
+		MemoryContextAlloc(rb->tup_context,
+						   sizeof(ReorderBufferTupleBuf) +
+						   MAXIMUM_ALIGNOF + alloc_len);
+	tuple->alloc_tuple_size = alloc_len;
+	tuple->tuple.t_data = ReorderBufferTupleBufData(tuple);
+
+	return tuple;
+}
+
+/*
+ * Convert zheap tuple to heap tuple.
+ *
+ * tbuf is input/output parameter to pass a pointer to the source buffer as
+ * well as to receive the new buffer.
+ */
+static void
+ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
+										  ReorderBuffer *rb,
+										  Relation relation)
+{
+	MemoryContext	oldcontext;
+	TupleDesc	desc = RelationGetDescr(relation);
+	int	natts = desc->natts;
+	Datum	*values;
+	bool	*isnull;
+	HeapTuple	tup;
+	HeapTupleHeader	t_data;
+	ReorderBufferTupleBuf	*tbuf = *tbuf_p;
+	ReorderBufferTupleBuf	*result;
+
+	oldcontext = MemoryContextSwitchTo(rb->tup_context);
+	values = (Datum *) palloc(natts * sizeof(Datum));
+	isnull = (bool *) palloc(natts * sizeof(bool));
+
+	/* Perform the conversion. */
+	zheap_deform_tuple((ZHeapTuple) &tbuf->tuple, desc, values, isnull,
+					   natts);
+	tup = heap_form_tuple(desc, values, isnull);
+
+	result = ReorderBufferGetTupleBuf(rb, tup->t_len - SizeofHeapTupleHeader);
+	t_data = result->tuple.t_data;
+	memcpy(&result->tuple, tup, sizeof(HeapTupleData));
+	/* Make the buffer point to its original data address. */
+	result->tuple.t_data = t_data;
+	/* Copy the actual data. */
+	memcpy(result->tuple.t_data, tup->t_data, tup->t_len);
+	/* Cleanup */
+	pfree(tup);
+	ReorderBufferReturnTupleBuf(rb, tbuf);
+	MemoryContextSwitchTo(oldcontext);
+
+	*tbuf_p = result;
 }
 
 /*
@@ -1505,6 +1585,7 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 		{
 			Relation	relation = NULL;
 			Oid			reloid;
+			bool	is_zheap = false;
 
 			switch (change->action)
 			{
@@ -1519,13 +1600,27 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 						elog(ERROR, "invalid ordering of speculative insertion changes");
 					Assert(specinsert->data.tp.oldtuple == NULL);
 					change = specinsert;
-					change->action = REORDER_BUFFER_CHANGE_INSERT;
+					if (change->action == REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT)
+						change->action = REORDER_BUFFER_CHANGE_INSERT;
+					else
+					{
+						Assert(change->action == REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP);
+						change->action = REORDER_BUFFER_CHANGE_INSERT_ZHEAP;
+					}
 
 					/* intentionally fall through */
 				case REORDER_BUFFER_CHANGE_INSERT:
 				case REORDER_BUFFER_CHANGE_UPDATE:
 				case REORDER_BUFFER_CHANGE_DELETE:
+				case REORDER_BUFFER_CHANGE_INSERT_ZHEAP:
+				case REORDER_BUFFER_CHANGE_UPDATE_ZHEAP:
+				case REORDER_BUFFER_CHANGE_DELETE_ZHEAP:
 					Assert(snapshot_now);
+
+					if (change->action == REORDER_BUFFER_CHANGE_INSERT_ZHEAP ||
+						change->action == REORDER_BUFFER_CHANGE_UPDATE_ZHEAP ||
+						change->action == REORDER_BUFFER_CHANGE_DELETE_ZHEAP)
+						is_zheap = true;
 
 					reloid = RelidByRelfilenode(change->data.tp.relnode.spcNode,
 												change->data.tp.relnode.relNode);
@@ -1542,10 +1637,14 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					 * identify whether the table should be logically logged
 					 * without mapping the relfilenode to the oid.
 					 */
-					if (reloid == InvalidOid &&
-						change->data.tp.newtuple == NULL &&
-						change->data.tp.oldtuple == NULL)
-						goto change_done;
+					if (reloid == InvalidOid)
+					{
+						/* Catalog tables do not use zheap. */
+						if (!is_zheap &&
+							change->data.tp.newtuple == NULL &&
+							change->data.tp.oldtuple == NULL)
+							goto change_done;
+					}
 					else if (reloid == InvalidOid)
 						elog(ERROR, "could not map filenode \"%s\" to relation OID",
 							 relpathperm(change->data.tp.relnode,
@@ -1581,7 +1680,43 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					/* user-triggered change */
 					if (!IsToastRelation(relation))
 					{
+						/*
+						 * Convert zheap tuple(s) to the traditional heap
+						 * tuple so that the output plugin does not need to do
+						 * anything special.
+						 */
+						if (is_zheap)
+						{
+							if (change->data.tp.oldtuple)
+								ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.oldtuple,
+																		  rb,
+																		  relation);
+							if (change->data.tp.newtuple)
+								ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.newtuple,
+																		  rb,
+																		  relation);
+							/*
+							 * Adjust the action type so the output plugin can
+							 * recognize it.
+							 */
+							switch (change->action)
+							{
+								case REORDER_BUFFER_CHANGE_INSERT_ZHEAP:
+									change->action = REORDER_BUFFER_CHANGE_INSERT;
+									break;
+								case REORDER_BUFFER_CHANGE_UPDATE_ZHEAP:
+									change->action = REORDER_BUFFER_CHANGE_UPDATE;
+									break;
+								case REORDER_BUFFER_CHANGE_DELETE_ZHEAP:
+									change->action = REORDER_BUFFER_CHANGE_DELETE;
+									break;
+								default:
+									Assert(false);
+							}
+						}
+
 						ReorderBufferToastReplace(rb, txn, relation, change);
+
 						rb->apply_change(rb, txn, relation, change);
 
 						/*
@@ -1593,7 +1728,8 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 							ReorderBufferToastReset(rb, txn);
 					}
 					/* we're not interested in toast deletions */
-					else if (change->action == REORDER_BUFFER_CHANGE_INSERT)
+					else if (change->action == REORDER_BUFFER_CHANGE_INSERT ||
+							 change->action == REORDER_BUFFER_CHANGE_INSERT_ZHEAP)
 					{
 						/*
 						 * Need to reassemble the full toasted Datum in
@@ -1606,6 +1742,20 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 						Assert(change->data.tp.newtuple != NULL);
 
 						dlist_delete(&change->node);
+
+						/*
+						 * Convert zheap tuple to the traditional heap tuple
+						 * so that the toasted attributes can be handled in an
+						 * uniform way.
+						 */
+						if (is_zheap && change->data.tp.newtuple)
+						{
+							ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.newtuple,
+																	  rb,
+																	  relation);
+							change->action = REORDER_BUFFER_CHANGE_INSERT;
+						}
+
 						ReorderBufferToastAppendChunk(rb, txn, relation,
 													  change);
 					}
@@ -1630,6 +1780,7 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					break;
 
 				case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT:
+				case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP:
 
 					/*
 					 * Speculative insertions are dealt with by delaying the
@@ -2346,12 +2497,37 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_UPDATE:
 		case REORDER_BUFFER_CHANGE_DELETE:
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT:
+		case REORDER_BUFFER_CHANGE_INSERT_ZHEAP:
+		case REORDER_BUFFER_CHANGE_UPDATE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_DELETE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP:
 			{
 				char	   *data;
 				ReorderBufferTupleBuf *oldtup,
 						   *newtup;
 				Size		oldlen = 0;
 				Size		newlen = 0;
+
+				/*
+				 * Currently the layout of ZHeapTupleData is identical to that
+				 * of HeapTupleData. Thus we can treat the zheap tuples in the
+				 * same way as heap tuples. XXX Should we also need to check
+				 * field sizes? Not sure, any change in the structure layout
+				 * will probably reveal itself by causing many compiler
+				 * errors.
+				 */
+				StaticAssertStmt(offsetof(HeapTupleData, t_len) ==
+								 offsetof(ZHeapTupleData, t_len),
+								 "HeapTupleData does not match ZHeapTupleData");
+				StaticAssertStmt(offsetof(HeapTupleData, t_self) ==
+								 offsetof(ZHeapTupleData, t_self),
+								 "HeapTupleData does not match ZHeapTupleData");
+				StaticAssertStmt(offsetof(HeapTupleData, t_tableOid) ==
+								 offsetof(ZHeapTupleData, t_tableOid),
+								 "HeapTupleData does not match ZHeapTupleData");
+				StaticAssertStmt(offsetof(HeapTupleData, t_data) ==
+								 offsetof(ZHeapTupleData, t_data),
+								 "HeapTupleData does not match ZHeapTupleData");
 
 				oldtup = change->data.tp.oldtuple;
 				newtup = change->data.tp.newtuple;
@@ -2670,6 +2846,15 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_UPDATE:
 		case REORDER_BUFFER_CHANGE_DELETE:
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT:
+		case REORDER_BUFFER_CHANGE_INSERT_ZHEAP:
+		case REORDER_BUFFER_CHANGE_UPDATE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_DELETE_ZHEAP:
+		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP:
+
+			/*
+			 * ZHeapTupleData is assumed to have the same layout as
+			 * HeapTupleData, see ReorderBufferSerializeChange.
+			 */
 			if (change->data.tp.oldtuple)
 			{
 				uint32		tuplelen = ((HeapTuple) data)->t_len;

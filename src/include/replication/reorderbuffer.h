@@ -44,6 +44,12 @@ typedef struct ReorderBufferTupleBuf
  * changes. Users of the decoding facilities will never see changes with
  * *_INTERNAL_* actions.
  *
+ * The *_ZHEAP types exist to distinguish the zheap-specific data changes when
+ * the catalog information about AM is not available (e.g. during
+ * serialization.) Users currently don't see them because we convert the zheap
+ * tuple to the ordinary heap tuple before passing it to the output plugin,
+ * for compatibility reasons.
+ *
  * The INTERNAL_SPEC_INSERT and INTERNAL_SPEC_CONFIRM changes concern
  * "speculative insertions", and their confirmation respectively.  They're
  * used by INSERT .. ON CONFLICT .. UPDATE.  Users of logical decoding don't
@@ -54,11 +60,15 @@ enum ReorderBufferChangeType
 	REORDER_BUFFER_CHANGE_INSERT,
 	REORDER_BUFFER_CHANGE_UPDATE,
 	REORDER_BUFFER_CHANGE_DELETE,
+	REORDER_BUFFER_CHANGE_INSERT_ZHEAP,
+	REORDER_BUFFER_CHANGE_UPDATE_ZHEAP,
+	REORDER_BUFFER_CHANGE_DELETE_ZHEAP,
 	REORDER_BUFFER_CHANGE_MESSAGE,
 	REORDER_BUFFER_CHANGE_INTERNAL_SNAPSHOT,
 	REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID,
 	REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID,
 	REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT,
+	REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT_ZHEAP,
 	REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM,
 	REORDER_BUFFER_CHANGE_TRUNCATE
 };
@@ -398,6 +408,8 @@ ReorderBuffer *ReorderBufferAllocate(void);
 void		ReorderBufferFree(ReorderBuffer *);
 
 ReorderBufferTupleBuf *ReorderBufferGetTupleBuf(ReorderBuffer *, Size tuple_len);
+ReorderBufferTupleBuf *ReorderBufferGetZHeapTupleBuf(ReorderBuffer *rb,
+													 Size tuple_len);
 void		ReorderBufferReturnTupleBuf(ReorderBuffer *, ReorderBufferTupleBuf *tuple);
 ReorderBufferChange *ReorderBufferGetChange(ReorderBuffer *);
 void		ReorderBufferReturnChange(ReorderBuffer *, ReorderBufferChange *);
