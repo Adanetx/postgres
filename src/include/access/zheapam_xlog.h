@@ -87,6 +87,7 @@ typedef struct xl_undo_header
 #define XLZ_INSERT_CONTAINS_NEW_TUPLE			(1<<3)
 #define XLZ_INSERT_CONTAINS_TPD_SLOT			(1<<4)
 #define XLZ_INSERT_IS_FROZEN					(1<<5)
+#define XLZ_INSERT_CONTAINS_SUBXID				(1<<6)
 
 /*
  * NOTE: t_hoff could be recomputed, but we may as well store it because
@@ -108,6 +109,8 @@ typedef struct xl_zheap_insert
 	OffsetNumber offnum;		/* inserted tuple's offset */
 	uint8		flags;
 
+	/* subxid follows the structure iff XLZ_INSERT_CONTAINS_SUBXID is set */
+
 	/* xl_zheap_header & TUPLE DATA in backup block 0 */
 } xl_zheap_insert;
 
@@ -123,6 +126,7 @@ typedef struct xl_zheap_insert
 #define XLZ_DELETE_CONTAINS_TPD_SLOT			(1<<2)
 #define XLZ_DELETE_CONTAINS_SUBXACT				(1<<3)
 #define XLZ_DELETE_IS_PARTITION_MOVE			(1<<4)
+#define XLZ_DELETE_CONTAINS_SUBXID				(1<<5)
 
 /* This is what we need to know about delete */
 typedef struct xl_zheap_delete
@@ -136,6 +140,8 @@ typedef struct xl_zheap_delete
 	uint16		infomask;		/* lock mode */
 	uint16		trans_slot_id;	/* transaction slot id */
 	uint8		flags;
+
+	/* subxid follows the structure iff XLZ_INSERT_CONTAINS_SUBXID is set */
 } xl_zheap_delete;
 
 #define SizeOfZHeapDelete	(offsetof(xl_zheap_delete, flags) + sizeof(uint8))
@@ -154,6 +160,7 @@ typedef struct xl_zheap_delete
 #define	XLZ_UPDATE_OLD_CONTAINS_TPD_SLOT		(1<<6)
 #define	XLZ_UPDATE_NEW_CONTAINS_TPD_SLOT		(1<<7)
 #define XLZ_UPDATE_CONTAINS_SUBXACT				(1<<8)
+#define XLZ_UPDATE_CONTAINS_SUBXID				(1<<9)
 
 /*
  * This is what we need to know about update|inplace_update
@@ -180,6 +187,8 @@ typedef struct xl_zheap_update
 	uint16		old_trans_slot_id;	/* old tuple's transaction slot id */
 	uint16		flags;
 	OffsetNumber new_offnum;	/* new tuple's offset */
+
+	/* subxid follows the structure iff XLZ_UPDATE_CONTAINS_SUBXID is set */
 } xl_zheap_update;
 
 #define SizeOfZHeapUpdate	(offsetof(xl_zheap_update, new_offnum) + sizeof(OffsetNumber))
@@ -219,7 +228,8 @@ typedef struct xl_zheap_lock
  * This is what we need to know about a multi-insert.
  *
  * The main data of the record consists of this xl_zheap_multi_insert header,
- * 'offset ranges' and tpd transaction slot number.
+ * 'offset ranges', tpd transaction slot number and optionally the
+ * subtransaction XID.
  *
  * In block 0's data portion, there is an xl_multi_insert_ztuple struct,
  * followed by the tuple data for each tuple. There is padding to align
@@ -230,6 +240,8 @@ typedef struct xl_zheap_multi_insert
 	/* zheap record related info */
 	uint8		flags;
 	uint16		ntuples;
+
+	/* subxid follows the structure iff XLZ_INSERT_CONTAINS_SUBXID is set */
 } xl_zheap_multi_insert;
 
 #define SizeOfZHeapMultiInsert	(offsetof(xl_zheap_multi_insert, ntuples) + sizeof(uint16))

@@ -532,7 +532,13 @@ DecodeZHeapOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	TransactionId xid = XLogRecGetXid(buf->record);
 	SnapBuild  *builder = ctx->snapshot_builder;
 
-	ReorderBufferProcessXid(ctx->reorder, xid, buf->origptr);
+	/*
+	 * Unlike the other Decode...Op() functions, ReorderBufferProcessXid() is
+	 * not called here because zheap operations do not store subtransaction
+	 * XID in the record header. The individual DecodeZHeap...() functions
+	 * retrieve the subxid and then register the transaction when calling
+	 * ReorderBufferQueueChange().
+	 */
 
 	/*
 	 * If we don't have snapshot or we are just fast-forwarding, there is no
@@ -848,16 +854,23 @@ DecodeZHeapInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_zheap_insert *xlrec;
 	ReorderBufferChange *change;
 	RelFileNode target_node;
+	TransactionId	xid;
 
 	xlrec = (xl_zheap_insert *) XLogRecGetData(r);
+	if (xlrec->flags & XLZ_INSERT_CONTAINS_SUBXID)
+		memcpy(&xid, (char *) xlrec + SizeOfZHeapInsert, sizeof(xid));
+	else
+		xid = XLogRecGetXid(r);
 
 	/*
 	 * This flag should be set as long as ZHEAP_INSERT_NO_LOGICAL is never
-	 * passed to zheap_insert().
+	 * passed to zheap_insert(), and as long as zheap is not used for catalog
+	 * tables (catalogs are not subject to logical decoding).
 	 *
-	 * TODO Check if raw_zheap_insert() should pass this option yet. Or is
-	 * there no need for rewrite with zheap? If it's so, make sure that VACUUM
-	 * FULL / CLUSTER commands are not executed on zheap tables.
+	 * TODO Check if raw_zheap_insert() should yet pass
+	 * ZHEAP_INSERT_NO_LOGICAL.  Or is there no need for rewrite with zheap?
+	 * If it's so, make sure that VACUUM FULL / CLUSTER commands are not
+	 * executed on zheap tables.
 	 */
 	Assert(xlrec->flags & XLZ_INSERT_CONTAINS_NEW_TUPLE);
 
@@ -887,7 +900,7 @@ DecodeZHeapInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.newtuple);
 
 	change->data.tp.clear_toast_afterwards = true;
-	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr, change);
+	ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change);
 }
 
 /*
@@ -969,13 +982,17 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	xl_undo_header *xlundohdr;
-	xl_zheap_update *xlrec;
+	xl_zheap_update xlrec;
 	RelFileNode target_node;
 	ReorderBufferChange *change;
+	TransactionId	xid;
+
+	recordlen = XLogRecGetDataLen(r);
 
 	xlundohdr = (xl_undo_header *) XLogRecGetData(r);
-	xlrec = (xl_zheap_update *) ((char *) xlundohdr + SizeOfUndoHeader);
-	recordlen = XLogRecGetDataLen(r);
+	tupledata = (char *) xlundohdr + SizeOfUndoHeader;
+	memcpy(&xlrec, tupledata, SizeOfZHeapUpdate);
+	tupledata += SizeOfZHeapUpdate;
 
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &target_node, NULL, NULL);
@@ -992,19 +1009,30 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	memcpy(&change->data.tp.relnode, &target_node, sizeof(RelFileNode));
 
-	tupledata = (char *) xlrec + SizeOfZHeapUpdate;
 	datalen = recordlen - SizeOfUndoHeader - SizeOfZHeapUpdate;
-	if (xlrec->flags & XLZ_UPDATE_OLD_CONTAINS_TPD_SLOT)
+
+	/* Find out the XID. */
+	if (xlrec.flags & XLZ_UPDATE_CONTAINS_SUBXID)
+	{
+		/* Subtransaction XID. */
+		memcpy(&xid, tupledata, sizeof(xid));
+		tupledata += sizeof(xid);
+		datalen -= sizeof(xid);
+	}
+	else
+		xid = XLogRecGetXid(r);
+
+	if (xlrec.flags & XLZ_UPDATE_OLD_CONTAINS_TPD_SLOT)
 	{
 		/* The old transaction slot id. */
 		tupledata += sizeof(int);
 		datalen -= sizeof(int);
 	}
-	if (xlrec->flags & XLZ_NON_INPLACE_UPDATE)
+	if (xlrec.flags & XLZ_NON_INPLACE_UPDATE)
 	{
 		tupledata += SizeOfUndoHeader;
 		datalen -= SizeOfUndoHeader;
-		if (xlrec->flags & XLZ_UPDATE_NEW_CONTAINS_TPD_SLOT)
+		if (xlrec.flags & XLZ_UPDATE_NEW_CONTAINS_TPD_SLOT)
 		{
 			/* The new transaction slot id. */
 			tupledata += sizeof(int);
@@ -1012,7 +1040,7 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		}
 	}
 	/* Logical decoding does enforce inclusion of the tuple(s) in WAL. */
-	Assert(xlrec->flags & XLZ_HAS_UPDATE_UNDOTUPLE);
+	Assert(xlrec.flags & XLZ_HAS_UPDATE_UNDOTUPLE);
 
 	tuplelen = datalen - SizeOfZHeapHeader;
 	change->data.tp.oldtuple =
@@ -1026,7 +1054,7 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	 * The prefix-suffix compression should be disabled if logical decoding is
 	 * active.
 	 */
-	Assert((xlrec->flags &
+	Assert((xlrec.flags &
 			(XLZ_UPDATE_PREFIX_FROM_OLD | XLZ_UPDATE_SUFFIX_FROM_OLD)) == 0);
 
 	tuplelen = datalen - SizeOfZHeapHeader;
@@ -1036,7 +1064,7 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	change->data.tp.clear_toast_afterwards = true;
 
-	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr, change);
+	ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change);
 }
 
 /*
@@ -1108,16 +1136,20 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	xl_undo_header *xlundohdr;
-	xl_zheap_delete *xlrec;
+	xl_zheap_delete xlrec;
 	RelFileNode target_node;
 	ReorderBufferChange *change;
+	TransactionId	xid;
 
-	xlundohdr = (xl_undo_header *) XLogRecGetData(r);
-	xlrec = (xl_zheap_delete *) ((char *) xlundohdr + SizeOfUndoHeader);
 	recordlen = XLogRecGetDataLen(r);
 
+	xlundohdr = (xl_undo_header *) XLogRecGetData(r);
+	tupledata = (char *) xlundohdr + SizeOfUndoHeader;
+	memcpy(&xlrec, tupledata, SizeOfZHeapDelete);
+	tupledata += SizeOfZHeapDelete;
+
 	/* Logical decoding does enforce inclusion of the tuple in WAL. */
-	Assert(xlrec->flags & XLZ_HAS_DELETE_UNDOTUPLE);
+	Assert(xlrec.flags & XLZ_HAS_DELETE_UNDOTUPLE);
 
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &target_node, NULL, NULL);
@@ -1134,9 +1166,20 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	memcpy(&change->data.tp.relnode, &target_node, sizeof(RelFileNode));
 
-	tupledata = (char *) xlrec + SizeOfZHeapDelete;
 	datalen = recordlen - SizeOfUndoHeader - SizeOfZHeapDelete;
-	if (xlrec->flags & XLZ_DELETE_CONTAINS_TPD_SLOT)
+
+	/* Find out the XID. */
+	if (xlrec.flags & XLZ_DELETE_CONTAINS_SUBXID)
+	{
+		/* Subtransaction XID. */
+		memcpy(&xid, tupledata, sizeof(xid));
+		tupledata += sizeof(xid);
+		datalen -= sizeof(xid);
+	}
+	else
+		xid = XLogRecGetXid(r);
+
+	if (xlrec.flags & XLZ_DELETE_CONTAINS_TPD_SLOT)
 	{
 		/* Transaction slot id. */
 		tupledata += sizeof(int);
@@ -1149,7 +1192,7 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.oldtuple);
 
 	change->data.tp.clear_toast_afterwards = true;
-	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr, change);
+	ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change);
 }
 
 /*
@@ -1303,11 +1346,24 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	Size	tuplelen;
 	int		nranges, i;
 	xl_undo_header *xlundohdr;
-	xl_zheap_multi_insert *xlrec;
+	xl_zheap_multi_insert xlrec;
 	RelFileNode rnode;
+	TransactionId	xid;
 
 	xlundohdr = (xl_undo_header *) XLogRecGetData(r);
-	xlrec = (xl_zheap_multi_insert *) ((char *) xlundohdr + SizeOfUndoHeader);
+	data = (char *) xlundohdr + SizeOfUndoHeader;
+	memcpy(&xlrec, data, SizeOfZHeapMultiInsert);
+	data += SizeOfZHeapMultiInsert;
+
+	/* Find out the XID. */
+	if (xlrec.flags & XLZ_INSERT_CONTAINS_SUBXID)
+	{
+		/* Subtransaction XID. */
+		memcpy(&xid, data, sizeof(xid));
+		data += sizeof(xid);
+	}
+	else
+		xid = XLogRecGetXid(r);
 
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &rnode, NULL, NULL);
@@ -1318,8 +1374,6 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
 		return;
 
-	data = (char *) xlrec + SizeOfZHeapMultiInsert;
-
 	/* Not really interested in the ranges, just skip that part. */
 	memcpy(&nranges, data, sizeof(int));
 	data += sizeof(int);
@@ -1328,7 +1382,7 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	tupledata = XLogRecGetBlockData(r, 0, &tuplelen);
 	data = tupledata;
 
-	for (i = 0; i < xlrec->ntuples; i++)
+	for (i = 0; i < xlrec.ntuples; i++)
 	{
 		ReorderBufferChange *change;
 		xl_multi_insert_ztuple *xlhdr;
@@ -1349,7 +1403,7 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		 * DecodeXLogZHeapTuple, but since the layout is slightly different,
 		 * we can't use it here.
 		 */
-		Assert(xlrec->flags & XLZ_INSERT_CONTAINS_NEW_TUPLE);
+		Assert(xlrec.flags & XLZ_INSERT_CONTAINS_NEW_TUPLE);
 
 		xlhdr = (xl_multi_insert_ztuple *) SHORTALIGN(data);
 		data = ((char *) xlhdr) + SizeOfMultiInsertZTuple;
@@ -1388,14 +1442,14 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		 * xl_multi_insert_tuple record emitted by one heap_multi_insert()
 		 * call.
 		 */
-		if (xlrec->flags & XLZ_INSERT_LAST_IN_MULTI &&
-			(i + 1) == xlrec->ntuples)
+		if (xlrec.flags & XLZ_INSERT_LAST_IN_MULTI &&
+			(i + 1) == xlrec.ntuples)
 			change->data.tp.clear_toast_afterwards = true;
 		else
 			change->data.tp.clear_toast_afterwards = false;
 
-		ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
-								 buf->origptr, change);
+		ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr,
+								 change);
 	}
 	Assert(data == tupledata + tuplelen);
 }

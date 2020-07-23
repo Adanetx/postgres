@@ -106,6 +106,8 @@ typedef struct xl_heap_delete
 	OffsetNumber offnum;		/* deleted tuple's offset */
 	uint8		infobits_set;	/* infomask bits */
 	uint8		flags;
+
+	/* subxid follows the structure iff XLZ_DELETE_CONTAINS_SUBXID is set */
 } xl_heap_delete;
 
 #define SizeOfHeapDelete	(offsetof(xl_heap_delete, flags) + sizeof(uint8))
