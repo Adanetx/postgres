@@ -1349,7 +1349,7 @@ DecodeZHeapMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		 * DecodeXLogZHeapTuple, but since the layout is slightly different,
 		 * we can't use it here.
 		 */
-		Assert(xlrec->flags & XLH_INSERT_CONTAINS_NEW_TUPLE);
+		Assert(xlrec->flags & XLZ_INSERT_CONTAINS_NEW_TUPLE);
 
 		xlhdr = (xl_multi_insert_ztuple *) SHORTALIGN(data);
 		data = ((char *) xlhdr) + SizeOfMultiInsertZTuple;
