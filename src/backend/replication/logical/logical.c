@@ -1121,8 +1121,15 @@ ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_changed, bool *
 		/*
 		 * When logging the entire old tuple, it very well could contain
 		 * toasted columns. If so, force them to be inlined.
+		 *
+		 * FIXME Make sure that the old tuple is flattened before it's
+		 * inserted into XLOG if logical decoding is enabled. Currently it
+		 * seems that the output plugin should not touch the external
+		 * attributes of the old tuple. Eventually remove the test of
+		 * "decoding", which is currently there only to prevent regression
+		 * tests from failure.
 		 */
-		if (HeapTupleHasExternal(tp))
+		if (!decoding && HeapTupleHasExternal(tp))
 		{
 			*copy = true;
 			tp = toast_flatten_tuple(tp, RelationGetDescr(relation));
@@ -1177,8 +1184,10 @@ ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_changed, bool *
 	 * since there's limits on the size of indexed columns, so we don't
 	 * duplicate toast_flatten_tuple()s functionality in the above loop over
 	 * the indexed columns, even if it would be more efficient.
+	 *
+	 * FIXME See above.
 	 */
-	if (HeapTupleHasExternal(key_tuple))
+	if (!decoding && HeapTupleHasExternal(key_tuple))
 	{
 		HeapTuple	oldtup = key_tuple;
 
