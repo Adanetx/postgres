@@ -135,7 +135,7 @@ static void log_zheap_insert(ZHeapWALInfo *walinfo, Relation relation,
 							 int options, bool skip_undo, TransactionId subxact_xid);
 static void log_zheap_update(ZHeapWALInfo *oldinfo, Relation relation,
 							 ZHeapWALInfo *newinfo, bool inplace_update,
-							 TransactionId subact_xid);
+							 TransactionId subact_xid, bool identity_changed);
 static void log_zheap_delete(ZHeapWALInfo *walinfo, Relation relation, bool changingPart,
 							 SubTransactionId subxid, TransactionId tup_xid,
 							 TransactionId subxact_xid);
@@ -1245,6 +1245,7 @@ zheap_update(Relation relation, ItemPointer otid, ZHeapTuple newtup,
 	SubTransactionId tup_subxid = InvalidSubTransactionId;
 	Bitmapset  *inplace_upd_attrs = NULL;
 	Bitmapset  *key_attrs = NULL;
+	Bitmapset  *id_attrs = NULL;
 	Bitmapset  *interesting_attrs = NULL;
 	bool		computed_modified_attrs = false;
 	Bitmapset  *modified_attrs = NULL;
@@ -1285,6 +1286,7 @@ zheap_update(Relation relation, ItemPointer otid, ZHeapTuple newtup,
 	bool		use_inplace_update;
 	bool		in_place_updated_or_locked = false;
 	bool		key_intact = false;
+	bool		id_intact = false;
 	bool		checked_lockers = false;
 	bool		locker_remains = false;
 	bool		any_multi_locker_member_alive = false;
@@ -1329,6 +1331,7 @@ zheap_update(Relation relation, ItemPointer otid, ZHeapTuple newtup,
 	 */
 	inplace_upd_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
 	key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+	id_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
 
 	block = ItemPointerGetBlockNumber(otid);
 	buffer = ReadBuffer(relation, block);
@@ -1374,6 +1377,7 @@ check_tup_satisfies_update:
 			 * grab weaker lock type.  See heap_update.
 			 */
 			key_intact = !bms_overlap(modified_attrs, key_attrs);
+			id_intact = !bms_overlap(modified_attrs, id_attrs);
 			*lockmode = key_intact ? LockTupleNoKeyExclusive :
 				LockTupleExclusive;
 		}
@@ -2159,6 +2163,7 @@ reacquire_buffer:
 	{
 		ZHeapWALInfo oldup_wal_info,
 					newup_wal_info;
+		bool	id_changed;
 
 		/*
 		 * For logical decoding we need combocids to properly decode the
@@ -2195,8 +2200,15 @@ reacquire_buffer:
 		newup_wal_info.prev_urecptr = InvalidUndoRecPtr;
 		newup_wal_info.prior_trans_slot_id = InvalidXactSlotId;
 
+		/*
+		 * Identity is also considered changed if there are no identity
+		 * columns - thus the output plugin will receive the whole old tuple.
+		 */
+		id_changed = id_attrs == NULL || !id_intact;
+
 		log_zheap_update(&oldup_wal_info, relation, &newup_wal_info,
-						 use_inplace_update, subxact_xid);
+						 use_inplace_update, subxact_xid,
+						 id_changed);
 	}
 
 	END_CRIT_SECTION();
@@ -5632,7 +5644,7 @@ prepare_xlog:
 static void
 log_zheap_update(ZHeapWALInfo *old_walinfo, Relation relation,
 				 ZHeapWALInfo *new_walinfo, bool inplace_update,
-				 TransactionId subact_xid)
+				 TransactionId subact_xid, bool identity_changed)
 {
 	xl_undo_header xlundohdr,
 				xlnewundohdr;
@@ -5785,6 +5797,13 @@ prepare_xlog:
 		xlundotuphdr.t_infomask = zhtuphdr->t_infomask;
 		xlundotuphdr.t_hoff = zhtuphdr->t_hoff;
 	}
+
+	/*
+	 * To be consistent with the heap AM, logical decoding plugin should not
+	 * receive the old tuple if the key hasn't changed.
+	 */
+	if (identity_changed)
+		xlrec.flags |= XLZ_UPDATE_IDENTITY_CHANGED;
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlundohdr, SizeOfUndoHeader);

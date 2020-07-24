@@ -166,6 +166,9 @@ static void ReorderBufferReturnTXN(ReorderBuffer *rb, ReorderBufferTXN *txn);
 static void ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
 													  ReorderBuffer *rb,
 													  Relation relation);
+static void SetupOldTupleIdentity(ReorderBuffer *rb,
+								  ReorderBufferChange *change,
+								  Relation relation);
 static ReorderBufferTXN *ReorderBufferTXNByXid(ReorderBuffer *rb,
 											   TransactionId xid, bool create, bool *is_new,
 											   XLogRecPtr lsn, bool create_as_top);
@@ -525,6 +528,61 @@ ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
 	MemoryContextSwitchTo(oldcontext);
 
 	*tbuf_p = result;
+}
+
+/*
+ * Make sure that the old tuple has the identity attributes initialized, or
+ * free the tuple if no identity is needed.
+ */
+static void
+SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
+					  Relation relation)
+{
+	HeapTuple	key_tuple;
+	bool	copy;
+
+	/*
+	 * While the heap XLOG records only contain the key values of the old
+	 * tuple, zheap relies on the whole old tuple to be there. So we need to
+	 * extract the key part (or rather to set the non-key attributes to NULL)
+	 * here, before the tuple is passed to the output plugin.
+	 *
+	 * key_changed is true, otherwise the old tuple wouldn't have been
+	 * decoded.
+	 */
+	key_tuple = ExtractReplicaIdentity(relation,
+									   &change->data.tp.oldtuple->tuple,
+									   true,
+									   &copy,
+									   true);
+	if (key_tuple == NULL)
+	{
+		/* Do not pass the old tuple to the plugin. */
+		pfree(change->data.tp.oldtuple);
+		change->data.tp.oldtuple = NULL;
+	}
+	else
+	{
+		ReorderBufferTupleBuf *key_tup_buf;
+		HeapTupleHeader	t_data;
+
+		key_tup_buf = ReorderBufferGetTupleBuf(rb,
+											   key_tuple->t_len - SizeofHeapTupleHeader);
+
+		t_data = key_tup_buf->tuple.t_data;
+
+		/* Populate the new buffer with data. */
+		memcpy(&key_tup_buf->tuple, key_tuple, sizeof(HeapTupleData));
+		memcpy(t_data, key_tuple->t_data, key_tuple->t_len);
+		key_tup_buf->tuple.t_data = t_data;
+
+		/* Replace the old buffer. */
+		pfree(change->data.tp.oldtuple);
+		change->data.tp.oldtuple = key_tup_buf;
+
+		if (copy)
+			pfree(key_tuple);
+	}
 }
 
 /*
@@ -1688,9 +1746,21 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 						if (is_zheap)
 						{
 							if (change->data.tp.oldtuple)
+							{
 								ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.oldtuple,
 																		  rb,
 																		  relation);
+
+								/*
+								 * There are specific requirements on DELETE
+								 * and UPDATE actions, at least from the
+								 * perspective of regression tests.
+								 */
+								if (change->action == REORDER_BUFFER_CHANGE_UPDATE_ZHEAP ||
+									change->action == REORDER_BUFFER_CHANGE_DELETE_ZHEAP)
+									SetupOldTupleIdentity(rb, change, relation);
+							}
+
 							if (change->data.tp.newtuple)
 								ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.newtuple,
 																		  rb,

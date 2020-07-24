@@ -161,6 +161,7 @@ typedef struct xl_zheap_delete
 #define	XLZ_UPDATE_NEW_CONTAINS_TPD_SLOT		(1<<7)
 #define XLZ_UPDATE_CONTAINS_SUBXACT				(1<<8)
 #define XLZ_UPDATE_CONTAINS_SUBXID				(1<<9)
+#define XLZ_UPDATE_IDENTITY_CHANGED				(1<<10)
 
 /*
  * This is what we need to know about update|inplace_update

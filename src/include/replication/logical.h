@@ -118,6 +118,8 @@ extern void LogicalIncreaseXminForSlot(XLogRecPtr lsn, TransactionId xmin);
 extern void LogicalIncreaseRestartDecodingForSlot(XLogRecPtr current_lsn,
 												  XLogRecPtr restart_lsn);
 extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
+extern HeapTuple ExtractReplicaIdentity(Relation rel, HeapTuple tup, bool key_modified,
+										bool *copy, bool decoding);
 
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
 

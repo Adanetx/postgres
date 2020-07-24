@@ -1042,10 +1042,16 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	/* Logical decoding does enforce inclusion of the tuple(s) in WAL. */
 	Assert(xlrec.flags & XLZ_HAS_UPDATE_UNDOTUPLE);
 
-	tuplelen = datalen - SizeOfZHeapHeader;
-	change->data.tp.oldtuple =
-		ReorderBufferGetZHeapTupleBuf(ctx->reorder, tuplelen);
-	DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.oldtuple);
+	/*
+	 * The output plugin only expects the old tuple if the update key changed.
+	 */
+	if (xlrec.flags & XLZ_UPDATE_IDENTITY_CHANGED)
+	{
+		tuplelen = datalen - SizeOfZHeapHeader;
+		change->data.tp.oldtuple =
+			ReorderBufferGetZHeapTupleBuf(ctx->reorder, tuplelen);
+		DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.oldtuple);
+	}
 
 	/* The new tuple. */
 	tupledata = XLogRecGetBlockData(r, 0, &datalen);
