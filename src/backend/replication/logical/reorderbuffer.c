@@ -558,7 +558,7 @@ SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
 	if (key_tuple == NULL)
 	{
 		/* Do not pass the old tuple to the plugin. */
-		pfree(change->data.tp.oldtuple);
+		ReorderBufferReturnTupleBuf(rb, change->data.tp.oldtuple);
 		change->data.tp.oldtuple = NULL;
 	}
 	else
@@ -577,7 +577,7 @@ SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
 		key_tup_buf->tuple.t_data = t_data;
 
 		/* Replace the old buffer. */
-		pfree(change->data.tp.oldtuple);
+		ReorderBufferReturnTupleBuf(rb, change->data.tp.oldtuple);
 		change->data.tp.oldtuple = key_tup_buf;
 
 		if (copy)
