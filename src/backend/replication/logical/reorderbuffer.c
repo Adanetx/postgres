@@ -531,8 +531,11 @@ ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
 }
 
 /*
- * Make sure that the old tuple has the identity attributes initialized, or
- * free the tuple if no identity is needed.
+ * Make sure that the old tuple has the identity attributes and only them
+ * initialized, or free the tuple if no identity is needed.
+ *
+ * We cannot eliminate the non-key attributes when creating the WAL record
+ * because with zheap the old tuple is also essential for recovery.
  */
 static void
 SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,

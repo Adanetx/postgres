@@ -589,6 +589,88 @@ ztoast_insert_or_update(Relation rel, ZHeapTuple newtup, ZHeapTuple oldtup,
 	return result_tuple;
 }
 
+/* ----------
+ * ztoast_flatten_tuple -
+ *
+ *  Like toast_flatten_tuple(), but to be used for zheap
+ * ----------
+ */
+ZHeapTuple
+ztoast_flatten_tuple(ZHeapTuple tup, TupleDesc tupleDesc)
+{
+	ZHeapTuple	new_tuple;
+	int			numAttrs = tupleDesc->natts;
+	int			i;
+	Datum		toast_values[MaxTupleAttributeNumber];
+	bool		toast_isnull[MaxTupleAttributeNumber];
+	bool		toast_free[MaxTupleAttributeNumber];
+
+	/*
+	 * Break down the tuple into fields.
+	 */
+	Assert(numAttrs <= MaxTupleAttributeNumber);
+	zheap_deform_tuple(tup, tupleDesc, toast_values, toast_isnull,
+					   tupleDesc->natts);
+
+	memset(toast_free, 0, numAttrs * sizeof(bool));
+
+	for (i = 0; i < numAttrs; i++)
+	{
+		/*
+		 * Look at non-null varlena attributes
+		 */
+		if (!toast_isnull[i] && TupleDescAttr(tupleDesc, i)->attlen == -1)
+		{
+			struct varlena *new_value;
+
+			new_value = (struct varlena *) DatumGetPointer(toast_values[i]);
+			if (VARATT_IS_EXTERNAL(new_value))
+			{
+				/*
+				 * TODO Don't we need heap_tuple_fetch_attr() /
+				 * heap_tuple_untoast_attr() in this module? While the scan
+				 * might work (e.g. visibility is checked according to the
+				 * actual AM of the table), I'm not sure if the fastgetattr()
+				 * macro can be used for zheap, see toast_fetch_datum().
+				 */
+				new_value = heap_tuple_fetch_attr(new_value);
+				toast_values[i] = PointerGetDatum(new_value);
+				toast_free[i] = true;
+			}
+		}
+	}
+
+	/*
+	 * Form the reconfigured tuple.
+	 */
+	new_tuple = zheap_form_tuple(tupleDesc, toast_values, toast_isnull);
+
+	/*
+	 * Be sure to copy the tuple's identity fields.  We also make a point of
+	 * copying visibility info, just in case anybody looks at those fields in
+	 * a syscache entry.
+	 */
+	new_tuple->t_self = tup->t_self;
+	new_tuple->t_tableOid = tup->t_tableOid;
+	/*
+	 * XXX With reference to the comment on syscache above: do we ever need
+	 * to copy any flags for zheap?
+	 */
+	new_tuple->t_data->t_infomask &= ~ZHEAP_VIS_STATUS_MASK;
+	new_tuple->t_data->t_infomask |=
+		tup->t_data->t_infomask & ZHEAP_VIS_STATUS_MASK;
+	new_tuple->t_data->t_infomask2 = tup->t_data->t_infomask2;
+
+	/*
+	 * Free allocated temp values
+	 */
+	for (i = 0; i < numAttrs; i++)
+		if (toast_free[i])
+			pfree(DatumGetPointer(toast_values[i]));
+
+	return new_tuple;
+}
+
 /*
  * ztoast_save_datum
  *		Just like toast_save_datum but for zheap relations.
