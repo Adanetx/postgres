@@ -2234,21 +2234,6 @@ reacquire_buffer:
 		ZHeapWALInfo oldup_wal_info,
 					newup_wal_info;
 
-		/*
-		 * For logical decoding we need combocids to properly decode the
-		 * catalog.
-		 */
-		if (RelationIsAccessibleInLogicalDecoding(relation))
-		{
-			/*
-			 * Fixme: This won't work as it needs to access cmin/cmax which we
-			 * probably needs to retrieve from UNDO.
-			 */
-			/*
-			 * log_heap_new_cid(relation, &oldtup); log_heap_new_cid(relation,
-			 * heaptup);
-			 */
-		}
 		oldup_wal_info.buffer = buffer;
 		oldup_wal_info.ztuple = &oldtup;
 		oldup_wal_info.urecptr = urecptr;
