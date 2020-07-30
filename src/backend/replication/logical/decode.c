@@ -1587,7 +1587,7 @@ DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 static void
 DecodeXLogZHeapTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 {
-	xl_heap_header xlhdr;
+	xl_zheap_header xlhdr;
 	int			datalen = len - SizeOfZHeapHeader;
 	ZHeapTupleHeader header;
 
