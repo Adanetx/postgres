@@ -1801,6 +1801,8 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					else if (change->action == REORDER_BUFFER_CHANGE_INSERT ||
 							 change->action == REORDER_BUFFER_CHANGE_INSERT_ZHEAP)
 					{
+						Assert(change->data.tp.newtuple != NULL);
+
 						/*
 						 * Need to reassemble the full toasted Datum in
 						 * memory, to ensure the chunks don't get reused till
@@ -1809,8 +1811,6 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 						 * freed/reused while restoring spooled data from
 						 * disk.
 						 */
-						Assert(change->data.tp.newtuple != NULL);
-
 						dlist_delete(&change->node);
 
 						/*
@@ -1818,11 +1818,12 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 						 * so that the toasted attributes can be handled in an
 						 * uniform way.
 						 */
-						if (is_zheap && change->data.tp.newtuple)
+						if (is_zheap)
 						{
 							ReorderBufferConvertZHeapTupleToHeapTuple(&change->data.tp.newtuple,
 																	  rb,
 																	  relation);
+							/* Probably not necessary ... */
 							change->action = REORDER_BUFFER_CHANGE_INSERT;
 						}
 
