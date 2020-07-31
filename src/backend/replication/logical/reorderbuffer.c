@@ -454,6 +454,7 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 						   MAXIMUM_ALIGNOF + alloc_len);
 	tuple->alloc_tuple_size = alloc_len;
 	tuple->tuple.t_data = ReorderBufferTupleBufData(tuple);
+	tuple->extra_data = 0;
 
 	return tuple;
 }
@@ -482,13 +483,15 @@ ReorderBufferGetZHeapTupleBuf(ReorderBuffer *rb, Size tuple_len)
 	tuple->alloc_tuple_size = alloc_len;
 	tuple->tuple.t_data = ReorderBufferTupleBufData(tuple);
 
+	tuple->extra_data = 0;
+
 	return tuple;
 }
 
 /*
  * Convert zheap tuple to heap tuple.
  *
- * tbuf is input/output parameter to pass a pointer to the source buffer as
+ * tbuf_p is input/output parameter to pass a pointer to the source buffer as
  * well as to receive the new buffer.
  */
 static void
@@ -515,13 +518,28 @@ ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
 					   natts);
 	tup = heap_form_tuple(desc, values, isnull);
 
-	result = ReorderBufferGetTupleBuf(rb, tup->t_len - SizeofHeapTupleHeader);
+	result = ReorderBufferGetTupleBuf(rb,
+									  tup->t_len - SizeofHeapTupleHeader +
+									  tbuf->extra_data);
 	t_data = result->tuple.t_data;
 	memcpy(&result->tuple, tup, sizeof(HeapTupleData));
 	/* Make the buffer point to its original data address. */
 	result->tuple.t_data = t_data;
 	/* Copy the actual data. */
 	memcpy(result->tuple.t_data, tup->t_data, tup->t_len);
+
+	/*
+	 * Copy the TOASTed identity keys if this is the old tuple of UPDATE or
+	 * DELETE command.
+	 */
+	if (tbuf->extra_data > 0)
+	{
+		memcpy((char *) result->tuple.t_data + result->tuple.t_len,
+			   (char *) tbuf->tuple.t_data + tbuf->tuple.t_len,
+			   tbuf->extra_data);
+		result->extra_data = tbuf->extra_data;
+	}
+
 	/* Cleanup */
 	pfree(tup);
 	ReorderBufferReturnTupleBuf(rb, tbuf);
@@ -534,33 +552,134 @@ ReorderBufferConvertZHeapTupleToHeapTuple(ReorderBufferTupleBuf **tbuf_p,
  * Make sure that the old tuple has the identity attributes and only them
  * initialized, or free the tuple if no identity is needed.
  *
- * We cannot eliminate the non-key attributes when creating the WAL record
- * because with zheap the old tuple is also essential for recovery.
+ * Unlike the heap AM, we cannot strip off the non-key attributes while
+ * creating the WAL record because zheap also needs the tuple for REDO /
+ * UNDO. So let's always adjust the tuple after decoding.
  */
 static void
 SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
 					  Relation relation)
 {
-	HeapTuple	key_tuple;
+	TupleDesc	desc = RelationGetDescr(relation);
+	int	i;
+	Datum	*values;
+	bool	*isnull;
+	Bitmapset  *id_attrs;
+	char	**value_bufs;
+	bool	found = false;
+	char *old_keys_ext = NULL;
+	HeapTuple	whole_tuple, key_tuple;
 	bool	copy;
 
 	/*
-	 * While the heap XLOG records only contain the key values of the old
-	 * tuple, zheap relies on the whole old tuple to be there. So we need to
-	 * extract the key part (or rather to set the non-key attributes to NULL)
-	 * here, before the tuple is passed to the output plugin.
+	 * Check if any identity attributes of the tuple are TOASTed, and if so,
+	 * replace them with their values that we retrieved from WAL. (The TOAST
+	 * tables are not guaranteed to be up-to-date or to even exist.)
+	 */
+	values = (Datum *) palloc(desc->natts * sizeof(Datum));
+	isnull = (bool *) palloc(desc->natts * sizeof(bool));
+
+	/*
+	 * The tuple should have been converted from zheap to heap format by
+	 * now.
+	 */
+	heap_deform_tuple(&change->data.tp.oldtuple->tuple, desc, values,
+					   isnull);
+
+	id_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+	value_bufs = (char **) palloc0(desc->natts * sizeof(char *));
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute	att;
+
+		if (isnull[i])
+			continue;
+
+		att = TupleDescAttr(desc, i);
+
+		/* Only interested in varlena attributes. */
+		if (att->attbyval || att->attlen != -1)
+			continue;
+
+		/* Check the identity attributes. */
+		if (relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
+			bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, id_attrs))
+		{
+			Pointer	value = DatumGetPointer(values[i]);
+			struct varlena	varhdr;
+
+			if (VARATT_IS_EXTERNAL(value))
+			{
+				Size	val_size;
+				char	*value_buf;
+
+				/*
+				 * The old tuple should just have been read from WAL, so no
+				 * other kinds of external attributes should have been set.
+				 */
+				Assert(VARATT_IS_EXTERNAL_ONDISK(value));
+
+				/*
+				 * If there's at least one such attribute, its value should be
+				 * stored in the tuple buffer, right after the tuple.
+				 */
+				if (old_keys_ext == NULL)
+				{
+					HeapTuple	tup = &change->data.tp.oldtuple->tuple;
+
+					old_keys_ext = (char *) tup->t_data + tup->t_len;
+				}
+
+				/*
+				 * Retrieve the data, but keep in mind that it's not
+				 * aligned.
+				 */
+				memcpy(&varhdr, old_keys_ext, VARHDRSZ);
+				val_size = VARSIZE(&varhdr);
+				value_buf = (char *) palloc(val_size);
+				memcpy(value_buf, old_keys_ext, val_size);
+
+				/* Replace the value. */
+				values[i] = PointerGetDatum(value_buf);
+
+				/* Make sure the buffer will be freed. */
+				value_bufs[i] = value_buf;
+
+				/* Get ready for the next value. */
+				old_keys_ext += val_size;
+
+				found = true;
+			}
+		}
+	}
+
+	if (found)
+		whole_tuple = heap_form_tuple(desc, values, isnull);
+	else
+	{
+		/*
+		 * The tuple has no TOASTed attributes, but have some which are not in
+		 * the identity key so the output plugin should not reference them.
+		 */
+		whole_tuple = &change->data.tp.oldtuple->tuple;
+	}
+
+	/*
+	 * While heap XLOG records only contain the key values of the old tuple,
+	 * zheap relies on the whole old tuple to be there. So we need to extract
+	 * the key part (or rather to set the non-key attributes to NULL) here,
+	 * before the tuple is passed to the output plugin.
 	 *
 	 * key_changed is true, otherwise the old tuple wouldn't have been
 	 * decoded.
 	 */
-	key_tuple = ExtractReplicaIdentity(relation,
-									   &change->data.tp.oldtuple->tuple,
-									   true,
-									   &copy,
+	key_tuple = ExtractReplicaIdentity(relation, whole_tuple, true, &copy,
 									   true);
 	if (key_tuple == NULL)
 	{
 		/* Do not pass the old tuple to the plugin. */
+		if (whole_tuple != &change->data.tp.oldtuple->tuple)
+			pfree(whole_tuple);
 		ReorderBufferReturnTupleBuf(rb, change->data.tp.oldtuple);
 		change->data.tp.oldtuple = NULL;
 	}
@@ -579,6 +698,10 @@ SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
 		memcpy(t_data, key_tuple->t_data, key_tuple->t_len);
 		key_tup_buf->tuple.t_data = t_data;
 
+		/* The last chance to see if whole_tuple is a copy. */
+		if (whole_tuple != &change->data.tp.oldtuple->tuple)
+			pfree(whole_tuple);
+
 		/* Replace the old buffer. */
 		ReorderBufferReturnTupleBuf(rb, change->data.tp.oldtuple);
 		change->data.tp.oldtuple = key_tup_buf;
@@ -586,6 +709,14 @@ SetupOldTupleIdentity(ReorderBuffer *rb, ReorderBufferChange *change,
 		if (copy)
 			pfree(key_tuple);
 	}
+
+	/* Cleanup. */
+	pfree(values);
+	pfree(isnull);
+	for (i = 0; i < desc->natts; i++)
+		if (value_bufs[i])
+			pfree(value_bufs[i]);
+	pfree(value_bufs);
 }
 
 /*
@@ -2610,6 +2741,7 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				{
 					sz += sizeof(HeapTupleData);
 					oldlen = oldtup->tuple.t_len;
+					oldlen += sizeof(oldtup->extra_data) + oldtup->extra_data;
 					sz += oldlen;
 				}
 
@@ -2617,6 +2749,7 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				{
 					sz += sizeof(HeapTupleData);
 					newlen = newtup->tuple.t_len;
+					newlen += sizeof(newtup->extra_data) + newtup->extra_data;
 					sz += newlen;
 				}
 
@@ -2629,20 +2762,32 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 				if (oldlen)
 				{
+					/*
+					 * Save the amount of extra data first so that we know at
+					 * restore time how large buffer we need.
+					 */
+					memcpy(data, &oldtup->extra_data, sizeof(oldtup->extra_data));
+					data += sizeof(oldtup->extra_data);
+
 					memcpy(data, &oldtup->tuple, sizeof(HeapTupleData));
 					data += sizeof(HeapTupleData);
 
-					memcpy(data, oldtup->tuple.t_data, oldlen);
-					data += oldlen;
+					memcpy(data, oldtup->tuple.t_data,
+						   oldlen - sizeof(oldtup->extra_data));
+					data += oldlen - sizeof(oldtup->extra_data);
 				}
 
 				if (newlen)
 				{
+					memcpy(data, &newtup->extra_data, sizeof(newtup->extra_data));
+					data += sizeof(newtup->extra_data);
+
 					memcpy(data, &newtup->tuple, sizeof(HeapTupleData));
 					data += sizeof(HeapTupleData);
 
-					memcpy(data, newtup->tuple.t_data, newlen);
-					data += newlen;
+					memcpy(data, newtup->tuple.t_data,
+						   newlen - sizeof(newtup->extra_data));
+					data += newlen - sizeof(newtup->extra_data);
 				}
 				break;
 			}
@@ -2931,10 +3076,17 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			 */
 			if (change->data.tp.oldtuple)
 			{
-				uint32		tuplelen = ((HeapTuple) data)->t_len;
+				uint32		tuplelen, extra_data;
+
+				memcpy(&extra_data, data, sizeof(extra_data));
+				data += sizeof(extra_data);
+
+				memcpy(&tuplelen, data + offsetof(HeapTupleData, t_len),
+					   sizeof(uint32));
 
 				change->data.tp.oldtuple =
-					ReorderBufferGetTupleBuf(rb, tuplelen - SizeofHeapTupleHeader);
+					ReorderBufferGetTupleBuf(rb, tuplelen - SizeofHeapTupleHeader +
+											 extra_data);
 
 				/* restore ->tuple */
 				memcpy(&change->data.tp.oldtuple->tuple, data,
@@ -2948,18 +3100,32 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				/* restore tuple data itself */
 				memcpy(change->data.tp.oldtuple->tuple.t_data, data, tuplelen);
 				data += tuplelen;
+
+				if (extra_data > 0)
+				{
+					HeapTuple	tup = &change->data.tp.oldtuple->tuple;
+
+					memcpy((char *) tup->t_data + tup->t_len, data,
+						   extra_data);
+					data += extra_data;
+					change->data.tp.oldtuple->extra_data = extra_data;
+				}
 			}
 
 			if (change->data.tp.newtuple)
 			{
 				/* here, data might not be suitably aligned! */
-				uint32		tuplelen;
+				uint32		tuplelen, extra_data;
+
+				memcpy(&extra_data, data, sizeof(extra_data));
+				data += sizeof(extra_data);
 
 				memcpy(&tuplelen, data + offsetof(HeapTupleData, t_len),
 					   sizeof(uint32));
 
 				change->data.tp.newtuple =
-					ReorderBufferGetTupleBuf(rb, tuplelen - SizeofHeapTupleHeader);
+					ReorderBufferGetTupleBuf(rb, tuplelen - SizeofHeapTupleHeader +
+											 extra_data);
 
 				/* restore ->tuple */
 				memcpy(&change->data.tp.newtuple->tuple, data,
@@ -2973,6 +3139,16 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				/* restore tuple data itself */
 				memcpy(change->data.tp.newtuple->tuple.t_data, data, tuplelen);
 				data += tuplelen;
+
+				if (extra_data > 0)
+				{
+					HeapTuple	tup = &change->data.tp.newtuple->tuple;
+
+					memcpy((char *) tup->t_data + tup->t_len, data,
+						   extra_data);
+					data += extra_data;
+					change->data.tp.newtuple->extra_data = extra_data;
+				}
 			}
 
 			break;

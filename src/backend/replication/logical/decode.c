@@ -986,6 +986,8 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	RelFileNode target_node;
 	ReorderBufferChange *change;
 	TransactionId	xid;
+	char *old_keys_ext = NULL;
+	uint32 old_keys_ext_size = 0;
 
 	recordlen = XLogRecGetDataLen(r);
 
@@ -1039,18 +1041,45 @@ DecodeZHeapUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			datalen -= sizeof(int);
 		}
 	}
+
+	/* Initialize the pointer to the TOASTed identity keys. */
+	if (xlrec.flags & XLZ_UPDATE_CONTAINS_OLD_KEYS_EXT)
+	{
+		memcpy(&old_keys_ext_size, tupledata, sizeof(old_keys_ext_size));
+		tupledata += sizeof(old_keys_ext_size);
+		datalen -= sizeof(old_keys_ext_size);
+
+		old_keys_ext = tupledata;
+		tupledata += old_keys_ext_size;
+		datalen -= old_keys_ext_size;
+	}
+
 	/* Logical decoding does enforce inclusion of the tuple(s) in WAL. */
 	Assert(xlrec.flags & XLZ_HAS_UPDATE_UNDOTUPLE);
 
 	/*
 	 * The output plugin only expects the old tuple if the update key changed.
+	 *
+	 * If the TOASTed identity keys are there, store them in the tuple buffer
+	 * as well.
 	 */
 	if (xlrec.flags & XLZ_UPDATE_IDENTITY_CHANGED)
 	{
 		tuplelen = datalen - SizeOfZHeapHeader;
+
 		change->data.tp.oldtuple =
-			ReorderBufferGetZHeapTupleBuf(ctx->reorder, tuplelen);
+			ReorderBufferGetZHeapTupleBuf(ctx->reorder, tuplelen +
+										  old_keys_ext_size);
 		DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.oldtuple);
+
+		if (old_keys_ext_size > 0)
+		{
+			HeapTuple tup = &change->data.tp.oldtuple->tuple;
+
+			memcpy((char *) tup->t_data + tup->t_len,
+				   old_keys_ext, old_keys_ext_size);
+			change->data.tp.oldtuple->extra_data = old_keys_ext_size;
+		}
 	}
 
 	/* The new tuple. */
@@ -1146,6 +1175,8 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	RelFileNode target_node;
 	ReorderBufferChange *change;
 	TransactionId	xid;
+	char *old_keys_ext = NULL;
+	uint32 old_keys_ext_size = 0;
 
 	recordlen = XLogRecGetDataLen(r);
 
@@ -1153,9 +1184,6 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	tupledata = (char *) xlundohdr + SizeOfUndoHeader;
 	memcpy(&xlrec, tupledata, SizeOfZHeapDelete);
 	tupledata += SizeOfZHeapDelete;
-
-	/* Logical decoding does enforce inclusion of the tuple in WAL. */
-	Assert(xlrec.flags & XLZ_HAS_DELETE_UNDOTUPLE);
 
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &target_node, NULL, NULL);
@@ -1191,11 +1219,41 @@ DecodeZHeapDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		tupledata += sizeof(int);
 		datalen -= sizeof(int);
 	}
+
+	/* Logical decoding does enforce inclusion of the tuple in WAL. */
+	Assert(xlrec.flags & XLZ_HAS_DELETE_UNDOTUPLE);
+
+	if (xlrec.flags & XLZ_DELETE_CONTAINS_OLD_KEYS_EXT)
+	{
+		memcpy(&old_keys_ext_size, tupledata, sizeof(old_keys_ext_size));
+		tupledata += sizeof(old_keys_ext_size);
+		datalen -= sizeof(old_keys_ext_size);
+
+		old_keys_ext = tupledata;
+
+		tupledata += old_keys_ext_size;
+		datalen -= old_keys_ext_size;
+	}
+
 	tuplelen = datalen - SizeOfZHeapHeader;
 
 	change->data.tp.oldtuple =
-		ReorderBufferGetZHeapTupleBuf(ctx->reorder, tuplelen);
+		ReorderBufferGetZHeapTupleBuf(ctx->reorder,
+									  tuplelen + old_keys_ext_size);
 	DecodeXLogZHeapTuple(tupledata, datalen, change->data.tp.oldtuple);
+
+	/*
+	 * If the TOASTed identity keys are there, store them in the tuple buffer
+	 * as well.
+	 */
+	if (old_keys_ext_size > 0)
+	{
+		HeapTuple tup = &change->data.tp.oldtuple->tuple;
+
+		memcpy((char *) tup->t_data + tup->t_len,
+			   old_keys_ext, old_keys_ext_size);
+		change->data.tp.oldtuple->extra_data = old_keys_ext_size;
+	}
 
 	change->data.tp.clear_toast_afterwards = true;
 	ReorderBufferQueueChange(ctx->reorder, xid, buf->origptr, change);

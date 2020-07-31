@@ -348,7 +348,6 @@ extern bool zheap_undo_actions(UndoRecInfo *urp_array, int first_idx, int last_i
 extern ZHeapTuple ztoast_insert_or_update(Relation rel,
 										  ZHeapTuple newtup, ZHeapTuple oldtup,
 										  int options, uint32 specToken);
-extern ZHeapTuple ztoast_flatten_tuple(ZHeapTuple tup, TupleDesc tupleDesc);
 extern void ztoast_delete(Relation rel, ZHeapTuple oldtup, bool is_speculative);
 
 #endif							/* ZHEAP_H */

@@ -1122,12 +1122,12 @@ ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_changed, bool *
 		 * When logging the entire old tuple, it very well could contain
 		 * toasted columns. If so, force them to be inlined.
 		 *
-		 * If the function is used during logical decoding, it should
-		 * receive the tuple flattened because the TOAST data is no longer
-		 * guaranteed to exist at decoding time (it could have been
-		 * VACUUMed or the user table could have been
-		 * dropped). Furthermore, toast_flatten_tuple() does not handle
-		 * zheap format.
+		 * If the function is used during logical decoding, it should receive
+		 * the tuple flattened (or at least the external key attributes
+		 * inlined) because the TOAST data is no longer guaranteed to exist at
+		 * decoding time (it could have been VACUUMed or the user table could
+		 * have been dropped). Furthermore, toast_flatten_tuple() does not
+		 * handle zheap format.
 		 */
 		if (!decoding && HeapTupleHasExternal(tp))
 		{

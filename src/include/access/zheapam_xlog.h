@@ -127,6 +127,7 @@ typedef struct xl_zheap_insert
 #define XLZ_DELETE_CONTAINS_SUBXACT				(1<<3)
 #define XLZ_DELETE_IS_PARTITION_MOVE			(1<<4)
 #define XLZ_DELETE_CONTAINS_SUBXID				(1<<5)
+#define XLZ_DELETE_CONTAINS_OLD_KEYS_EXT		(1<<6)
 
 /* This is what we need to know about delete */
 typedef struct xl_zheap_delete
@@ -162,6 +163,7 @@ typedef struct xl_zheap_delete
 #define XLZ_UPDATE_CONTAINS_SUBXACT				(1<<8)
 #define XLZ_UPDATE_CONTAINS_SUBXID				(1<<9)
 #define XLZ_UPDATE_IDENTITY_CHANGED				(1<<10)
+#define XLZ_UPDATE_CONTAINS_OLD_KEYS_EXT		(1<<11)
 
 /*
  * This is what we need to know about update|inplace_update

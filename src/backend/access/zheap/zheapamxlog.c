@@ -318,6 +318,19 @@ zheap_xlog_delete(XLogReaderState *record)
 	zheaptup.t_self = target_tid;
 
 	/*
+	 * The old tuple key is only needed for logical decoding, skip it during
+	 * normal redo.
+	 */
+	if (xlrec.flags & XLZ_DELETE_CONTAINS_OLD_KEYS_EXT)
+	{
+		uint32	old_keys_ext_size;
+
+		memcpy(&old_keys_ext_size, data, sizeof(old_keys_ext_size));
+		Assert(old_keys_ext_size > 0);
+		data += sizeof(old_keys_ext_size) + old_keys_ext_size;
+	}
+
+	/*
 	 * If the WAL stream contains undo tuple, then replace it with the
 	 * explicitly stored tuple.
 	 */
@@ -560,6 +573,19 @@ zheap_xlog_update(XLogReaderState *record)
 	oldtup.t_self = oldtid;
 
 	/*
+	 * The old tuple key is only needed for logical decoding, skip it during
+	 * normal redo.
+	 */
+	if (xlrec.flags & XLZ_UPDATE_CONTAINS_OLD_KEYS_EXT)
+	{
+		uint32	old_keys_ext_size;
+
+		memcpy(&old_keys_ext_size, data, sizeof(old_keys_ext_size));
+		Assert(old_keys_ext_size > 0);
+		data += sizeof(old_keys_ext_size) + old_keys_ext_size;
+	}
+
+	/*
 	 * If the WAL stream contains undo tuple, then replace it with the
 	 * explicitly stored tuple.
 	 */
@@ -577,13 +603,12 @@ zheap_xlog_update(XLogReaderState *record)
 		memcpy((char *) zhtup + SizeofZHeapTupleHeader,
 			   data,
 			   datalen);
-		datalen += SizeofZHeapTupleHeader;
 		zhtup->t_infomask2 = xlhdr.t_infomask2;
 		zhtup->t_infomask = xlhdr.t_infomask;
 		zhtup->t_hoff = xlhdr.t_hoff;
 
 		oldtup.t_data = zhtup;
-		oldtup.t_len = datalen;
+		oldtup.t_len = datalen + SizeofZHeapTupleHeader;
 	}
 
 	/* prepare an undo record */
