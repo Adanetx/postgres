@@ -5629,7 +5629,7 @@ prepare_xlog:
 			Assert(top_xid != InvalidTransactionId);
 
 			xlrec.flags |= XLZ_INSERT_CONTAINS_SUBXID;
-			XLogRegisterData((char *) &subxact_xid, subxact_xid);
+			XLogRegisterData((char *) &subxact_xid, sizeof(subxact_xid));
 		}
 	}
 
