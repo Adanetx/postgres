@@ -6029,6 +6029,9 @@ prepare_xlog:
 	if (recptr == InvalidXLogRecPtr)
 	{
 		ResetRegisteredTPDBuffers();
+		/* A new decision about the old tuple may be needed. */
+		if (!need_tuple_data)
+			xlrec.flags &= ~XLZ_HAS_UPDATE_UNDOTUPLE;
 		goto prepare_xlog;
 	}
 
@@ -6232,6 +6235,9 @@ prepare_xlog:
 	if (recptr == InvalidXLogRecPtr)
 	{
 		ResetRegisteredTPDBuffers();
+		/* A new decision about the old tuple may be needed. */
+		if (!RelationIsLogicallyLogged(relation))
+			xlrec.flags &= ~XLZ_HAS_DELETE_UNDOTUPLE;
 		goto prepare_xlog;
 	}
 	PageSetLSN(page, recptr);
